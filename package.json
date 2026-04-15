@@ -1,0 +1,36 @@
+{
+  "name": "mcp-open-auth",
+  "version": "0.1.0",
+  "description": "Reusable OAuth provider for MCP servers with credential forms",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.0",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.0",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.10.0",
+    "express": "^4.21.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
