@@ -5,7 +5,7 @@ import { createRouter, createBearerMiddleware } from "./router.js";
 export type { OpenAuthOptions, OpenAuthResult, FieldDefinition } from "./types.js";
 
 export function createOpenAuth(options: OpenAuthOptions): OpenAuthResult {
-  const provider = new OpenAuthProvider(options.serviceName, options.fields);
+  const provider = new OpenAuthProvider(options.serviceName, options.fields, options.storagePath);
 
   return {
     router: () => createRouter(provider, options),

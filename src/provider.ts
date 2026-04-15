@@ -10,7 +10,8 @@ import {
   OAuthTokenRevocationRequest,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { InMemoryClientStore } from "./client-store.js";
+import { ClientStore } from "./client-store.js";
+import { FileStore } from "./store.js";
 import { FieldDefinition } from "./types.js";
 import { renderForm } from "./form.js";
 
@@ -22,8 +23,10 @@ interface PendingAuth {
 const TOKEN_TTL = 3600 * 24 * 30; // 30 days
 
 export class OpenAuthProvider implements OAuthServerProvider {
-  readonly clientsStore = new InMemoryClientStore();
+  readonly clientsStore: ClientStore;
+  private fileStore?: FileStore;
 
+  // Ephemeral — no persistence needed
   private pending = new Map<string, PendingAuth>();
   private codes = new Map<
     string,
@@ -34,13 +37,90 @@ export class OpenAuthProvider implements OAuthServerProvider {
       credentials: Record<string, string>;
     }
   >();
-  private tokenCredentials = new Map<string, Record<string, string>>();
-  private tokens = new Map<string, AuthInfo>();
+
+  // Persisted when fileStore is set, otherwise in-memory
+  private memTokenCredentials = new Map<string, Record<string, string>>();
+  private memRefreshTokenCredentials = new Map<string, Record<string, string>>();
+  private memTokens = new Map<string, AuthInfo>();
 
   constructor(
     private serviceName: string,
     private fields: FieldDefinition[],
-  ) {}
+    storagePath?: string,
+  ) {
+    if (storagePath) {
+      this.fileStore = new FileStore(storagePath);
+    }
+    this.clientsStore = new ClientStore(this.fileStore);
+  }
+
+  // --- Storage helpers ---
+
+  private getToken(token: string): AuthInfo | undefined {
+    return this.fileStore ? this.fileStore.getToken(token) : this.memTokens.get(token);
+  }
+
+  private setToken(token: string, info: AuthInfo): void {
+    if (this.fileStore) {
+      this.fileStore.setToken(token, info);
+    } else {
+      this.memTokens.set(token, info);
+    }
+  }
+
+  private deleteToken(token: string): void {
+    if (this.fileStore) {
+      this.fileStore.deleteToken(token);
+    } else {
+      this.memTokens.delete(token);
+    }
+  }
+
+  private getTokenCreds(token: string): Record<string, string> | undefined {
+    return this.fileStore
+      ? this.fileStore.getTokenCredentials(token)
+      : this.memTokenCredentials.get(token);
+  }
+
+  private setTokenCreds(token: string, creds: Record<string, string>): void {
+    if (this.fileStore) {
+      this.fileStore.setTokenCredentials(token, creds);
+    } else {
+      this.memTokenCredentials.set(token, creds);
+    }
+  }
+
+  private deleteTokenCreds(token: string): void {
+    if (this.fileStore) {
+      this.fileStore.deleteTokenCredentials(token);
+    } else {
+      this.memTokenCredentials.delete(token);
+    }
+  }
+
+  private getRefreshCreds(token: string): Record<string, string> | undefined {
+    return this.fileStore
+      ? this.fileStore.getRefreshTokenCredentials(token)
+      : this.memRefreshTokenCredentials.get(token);
+  }
+
+  private setRefreshCreds(token: string, creds: Record<string, string>): void {
+    if (this.fileStore) {
+      this.fileStore.setRefreshTokenCredentials(token, creds);
+    } else {
+      this.memRefreshTokenCredentials.set(token, creds);
+    }
+  }
+
+  private deleteRefreshCreds(token: string): void {
+    if (this.fileStore) {
+      this.fileStore.deleteRefreshTokenCredentials(token);
+    } else {
+      this.memRefreshTokenCredentials.delete(token);
+    }
+  }
+
+  // --- OAuth flow ---
 
   async authorize(
     client: OAuthClientInformationFull,
@@ -99,8 +179,9 @@ export class OpenAuthProvider implements OAuthServerProvider {
     const accessToken = randomBytes(32).toString("hex");
     const refreshToken = randomBytes(32).toString("hex");
 
-    this.tokenCredentials.set(accessToken, entry.credentials);
-    this.tokens.set(accessToken, {
+    this.setTokenCreds(accessToken, entry.credentials);
+    this.setRefreshCreds(refreshToken, entry.credentials);
+    this.setToken(accessToken, {
       token: accessToken,
       clientId: client.client_id,
       scopes: [],
@@ -115,11 +196,22 @@ export class OpenAuthProvider implements OAuthServerProvider {
     };
   }
 
-  async exchangeRefreshToken(client: OAuthClientInformationFull): Promise<OAuthTokens> {
+  async exchangeRefreshToken(
+    client: OAuthClientInformationFull,
+    oldRefreshToken: string,
+  ): Promise<OAuthTokens> {
+    const credentials = this.getRefreshCreds(oldRefreshToken);
+    this.deleteRefreshCreds(oldRefreshToken);
+
     const accessToken = randomBytes(32).toString("hex");
     const refreshToken = randomBytes(32).toString("hex");
 
-    this.tokens.set(accessToken, {
+    if (credentials) {
+      this.setTokenCreds(accessToken, credentials);
+      this.setRefreshCreds(refreshToken, credentials);
+    }
+
+    this.setToken(accessToken, {
       token: accessToken,
       clientId: client.client_id,
       scopes: [],
@@ -135,11 +227,11 @@ export class OpenAuthProvider implements OAuthServerProvider {
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const info = this.tokens.get(token);
+    const info = this.getToken(token);
     if (!info) throw new Error("Invalid access token");
     if (info.expiresAt && info.expiresAt < Math.floor(Date.now() / 1000)) {
-      this.tokens.delete(token);
-      this.tokenCredentials.delete(token);
+      this.deleteToken(token);
+      this.deleteTokenCreds(token);
       throw new Error("Access token expired");
     }
     return info;
@@ -149,11 +241,11 @@ export class OpenAuthProvider implements OAuthServerProvider {
     _client: OAuthClientInformationFull,
     request: OAuthTokenRevocationRequest,
   ): Promise<void> {
-    this.tokens.delete(request.token);
-    this.tokenCredentials.delete(request.token);
+    this.deleteToken(request.token);
+    this.deleteTokenCreds(request.token);
   }
 
   getCredentials(accessToken: string): Record<string, string> | undefined {
-    return this.tokenCredentials.get(accessToken);
+    return this.getTokenCreds(accessToken);
   }
 }

@@ -25,6 +25,11 @@ export interface OpenAuthOptions {
    * Throw an Error with a user-facing message if validation fails.
    */
   validate: (credentials: Record<string, string>) => Promise<void>;
+  /**
+   * Path to a JSON file for persistent storage of tokens and credentials.
+   * When set, data survives server restarts. When omitted, everything is in-memory only.
+   */
+  storagePath?: string;
 }
 
 export interface OpenAuthResult {

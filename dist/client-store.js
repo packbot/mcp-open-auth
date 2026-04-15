@@ -1,8 +1,15 @@
 import { randomBytes } from "crypto";
-export class InMemoryClientStore {
-    clients = new Map();
+export class ClientStore {
+    fileStore;
+    memory = new Map();
+    constructor(fileStore) {
+        this.fileStore = fileStore;
+    }
     getClient(clientId) {
-        return this.clients.get(clientId);
+        if (this.fileStore) {
+            return this.fileStore.getClient(clientId);
+        }
+        return this.memory.get(clientId);
     }
     registerClient(client) {
         const full = {
@@ -12,7 +19,12 @@ export class InMemoryClientStore {
             client_secret: randomBytes(32).toString("hex"),
             client_secret_expires_at: 0,
         };
-        this.clients.set(full.client_id, full);
+        if (this.fileStore) {
+            this.fileStore.setClient(full.client_id, full);
+        }
+        else {
+            this.memory.set(full.client_id, full);
+        }
         return full;
     }
 }
