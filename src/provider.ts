@@ -10,8 +10,12 @@ import {
   OAuthTokenRevocationRequest,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import {
+  InvalidGrantError,
+  InvalidTokenError,
+} from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { ClientStore } from "./client-store.js";
-import { FileStore } from "./store.js";
+import { Credentials, Store } from "./store.js";
 import { FieldDefinition } from "./types.js";
 import { renderForm } from "./form.js";
 
@@ -20,104 +24,33 @@ interface PendingAuth {
   params: AuthorizationParams;
 }
 
+interface AuthorizationCode {
+  codeChallenge: string;
+  redirectUri: string;
+  clientId: string;
+  credentials: Credentials;
+}
+
 const TOKEN_TTL = 3600 * 24 * 30; // 30 days
+// Sliding: every refresh issues a new refresh token with a fresh lifetime
+const REFRESH_TOKEN_TTL = 3600 * 24 * 90; // 90 days
+const PENDING_TTL_MS = 10 * 60 * 1000;
 
 export class OpenAuthProvider implements OAuthServerProvider {
   readonly clientsStore: ClientStore;
-  private fileStore?: FileStore;
+  private store: Store;
 
-  // Ephemeral — no persistence needed
+  // Short-lived, so memory is enough
   private pending = new Map<string, PendingAuth>();
-  private codes = new Map<
-    string,
-    {
-      codeChallenge: string;
-      redirectUri: string;
-      clientId: string;
-      credentials: Record<string, string>;
-    }
-  >();
-
-  // Persisted when fileStore is set, otherwise in-memory
-  private memTokenCredentials = new Map<string, Record<string, string>>();
-  private memRefreshTokenCredentials = new Map<string, Record<string, string>>();
-  private memTokens = new Map<string, AuthInfo>();
+  private codes = new Map<string, AuthorizationCode>();
 
   constructor(
     private serviceName: string,
     private fields: FieldDefinition[],
     storagePath?: string,
   ) {
-    if (storagePath) {
-      this.fileStore = new FileStore(storagePath);
-    }
-    this.clientsStore = new ClientStore(this.fileStore);
-  }
-
-  // --- Storage helpers ---
-
-  private getToken(token: string): AuthInfo | undefined {
-    return this.fileStore ? this.fileStore.getToken(token) : this.memTokens.get(token);
-  }
-
-  private setToken(token: string, info: AuthInfo): void {
-    if (this.fileStore) {
-      this.fileStore.setToken(token, info);
-    } else {
-      this.memTokens.set(token, info);
-    }
-  }
-
-  private deleteToken(token: string): void {
-    if (this.fileStore) {
-      this.fileStore.deleteToken(token);
-    } else {
-      this.memTokens.delete(token);
-    }
-  }
-
-  private getTokenCreds(token: string): Record<string, string> | undefined {
-    return this.fileStore
-      ? this.fileStore.getTokenCredentials(token)
-      : this.memTokenCredentials.get(token);
-  }
-
-  private setTokenCreds(token: string, creds: Record<string, string>): void {
-    if (this.fileStore) {
-      this.fileStore.setTokenCredentials(token, creds);
-    } else {
-      this.memTokenCredentials.set(token, creds);
-    }
-  }
-
-  private deleteTokenCreds(token: string): void {
-    if (this.fileStore) {
-      this.fileStore.deleteTokenCredentials(token);
-    } else {
-      this.memTokenCredentials.delete(token);
-    }
-  }
-
-  private getRefreshCreds(token: string): Record<string, string> | undefined {
-    return this.fileStore
-      ? this.fileStore.getRefreshTokenCredentials(token)
-      : this.memRefreshTokenCredentials.get(token);
-  }
-
-  private setRefreshCreds(token: string, creds: Record<string, string>): void {
-    if (this.fileStore) {
-      this.fileStore.setRefreshTokenCredentials(token, creds);
-    } else {
-      this.memRefreshTokenCredentials.set(token, creds);
-    }
-  }
-
-  private deleteRefreshCreds(token: string): void {
-    if (this.fileStore) {
-      this.fileStore.deleteRefreshTokenCredentials(token);
-    } else {
-      this.memRefreshTokenCredentials.delete(token);
-    }
+    this.store = new Store(storagePath, REFRESH_TOKEN_TTL);
+    this.clientsStore = new ClientStore(this.store);
   }
 
   // --- OAuth flow ---
@@ -129,7 +62,7 @@ export class OpenAuthProvider implements OAuthServerProvider {
   ): Promise<void> {
     const pendingId = randomBytes(16).toString("hex");
     this.pending.set(pendingId, { client, params });
-    setTimeout(() => this.pending.delete(pendingId), 10 * 60 * 1000);
+    setTimeout(() => this.pending.delete(pendingId), PENDING_TTL_MS).unref();
 
     res.setHeader("Content-Type", "text/html");
     res.send(renderForm(this.serviceName, this.fields, pendingId));
@@ -137,7 +70,7 @@ export class OpenAuthProvider implements OAuthServerProvider {
 
   completePendingAuth(
     pendingId: string,
-    credentials: Record<string, string>,
+    credentials: Credentials,
   ): { redirectUrl: string } | null {
     const pending = this.pending.get(pendingId);
     if (!pending) return null;
@@ -150,6 +83,7 @@ export class OpenAuthProvider implements OAuthServerProvider {
       clientId: pending.client.client_id,
       credentials,
     });
+    setTimeout(() => this.codes.delete(code), PENDING_TTL_MS).unref();
 
     const redirectUrl = new URL(pending.params.redirectUri);
     redirectUrl.searchParams.set("code", code);
@@ -159,63 +93,64 @@ export class OpenAuthProvider implements OAuthServerProvider {
     return { redirectUrl: redirectUrl.toString() };
   }
 
+  private getCode(client: OAuthClientInformationFull, code: string): AuthorizationCode {
+    const entry = this.codes.get(code);
+    if (!entry || entry.clientId !== client.client_id) {
+      throw new InvalidGrantError("Invalid authorization code");
+    }
+    return entry;
+  }
+
   async challengeForAuthorizationCode(
-    _client: OAuthClientInformationFull,
+    client: OAuthClientInformationFull,
     authorizationCode: string,
   ): Promise<string> {
-    const entry = this.codes.get(authorizationCode);
-    if (!entry) throw new Error("Invalid authorization code");
-    return entry.codeChallenge;
+    return this.getCode(client, authorizationCode).codeChallenge;
   }
 
   async exchangeAuthorizationCode(
     client: OAuthClientInformationFull,
     authorizationCode: string,
+    _codeVerifier?: string,
+    redirectUri?: string,
   ): Promise<OAuthTokens> {
-    const entry = this.codes.get(authorizationCode);
-    if (!entry) throw new Error("Invalid authorization code");
+    const entry = this.getCode(client, authorizationCode);
+    if (redirectUri !== undefined && redirectUri !== entry.redirectUri) {
+      throw new InvalidGrantError("redirect_uri does not match the authorization request");
+    }
     this.codes.delete(authorizationCode);
-
-    const accessToken = randomBytes(32).toString("hex");
-    const refreshToken = randomBytes(32).toString("hex");
-
-    this.setTokenCreds(accessToken, entry.credentials);
-    this.setRefreshCreds(refreshToken, entry.credentials);
-    this.setToken(accessToken, {
-      token: accessToken,
-      clientId: client.client_id,
-      scopes: [],
-      expiresAt: Math.floor(Date.now() / 1000) + TOKEN_TTL,
-    });
-
-    return {
-      access_token: accessToken,
-      token_type: "Bearer",
-      expires_in: TOKEN_TTL,
-      refresh_token: refreshToken,
-    };
+    return this.issueTokens(client.client_id, entry.credentials);
   }
 
   async exchangeRefreshToken(
     client: OAuthClientInformationFull,
-    oldRefreshToken: string,
+    refreshToken: string,
   ): Promise<OAuthTokens> {
-    const credentials = this.getRefreshCreds(oldRefreshToken);
-    this.deleteRefreshCreds(oldRefreshToken);
+    const entry = this.store.getRefreshToken(refreshToken);
+    // Refresh tokens migrated from the v1 store have no client and are accepted from any
+    if (!entry || (entry.clientId && entry.clientId !== client.client_id)) {
+      throw new InvalidGrantError("Invalid refresh token");
+    }
+    this.store.deleteRefreshToken(refreshToken);
+    return this.issueTokens(client.client_id, entry.credentials);
+  }
 
+  private issueTokens(clientId: string, credentials: Credentials): OAuthTokens {
     const accessToken = randomBytes(32).toString("hex");
     const refreshToken = randomBytes(32).toString("hex");
+    const now = Math.floor(Date.now() / 1000);
 
-    if (credentials) {
-      this.setTokenCreds(accessToken, credentials);
-      this.setRefreshCreds(refreshToken, credentials);
-    }
-
-    this.setToken(accessToken, {
-      token: accessToken,
-      clientId: client.client_id,
+    this.store.setAccessToken(accessToken, {
+      clientId,
       scopes: [],
-      expiresAt: Math.floor(Date.now() / 1000) + TOKEN_TTL,
+      expiresAt: now + TOKEN_TTL,
+      credentials,
+    });
+    this.store.setRefreshToken(refreshToken, {
+      clientId,
+      scopes: [],
+      expiresAt: now + REFRESH_TOKEN_TTL,
+      credentials,
     });
 
     return {
@@ -227,25 +162,26 @@ export class OpenAuthProvider implements OAuthServerProvider {
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const info = this.getToken(token);
-    if (!info) throw new Error("Invalid access token");
-    if (info.expiresAt && info.expiresAt < Math.floor(Date.now() / 1000)) {
-      this.deleteToken(token);
-      this.deleteTokenCreds(token);
-      throw new Error("Access token expired");
-    }
-    return info;
+    const entry = this.store.getAccessToken(token);
+    if (!entry?.clientId) throw new InvalidTokenError("Invalid or expired access token");
+    return {
+      token,
+      clientId: entry.clientId,
+      scopes: entry.scopes,
+      expiresAt: entry.expiresAt,
+    };
   }
 
+  // The token type hint is optional, so try both kinds
   async revokeToken(
     _client: OAuthClientInformationFull,
     request: OAuthTokenRevocationRequest,
   ): Promise<void> {
-    this.deleteToken(request.token);
-    this.deleteTokenCreds(request.token);
+    this.store.deleteAccessToken(request.token);
+    this.store.deleteRefreshToken(request.token);
   }
 
-  getCredentials(accessToken: string): Record<string, string> | undefined {
-    return this.getTokenCreds(accessToken);
+  getCredentials(accessToken: string): Credentials | undefined {
+    return this.store.getAccessToken(accessToken)?.credentials;
   }
 }

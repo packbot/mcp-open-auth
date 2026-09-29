@@ -1,18 +1,13 @@
 import { randomBytes } from "crypto";
 import { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { FileStore } from "./store.js";
+import { Store } from "./store.js";
 
 export class ClientStore implements OAuthRegisteredClientsStore {
-  private memory = new Map<string, OAuthClientInformationFull>();
-
-  constructor(private fileStore?: FileStore) {}
+  constructor(private store: Store) {}
 
   getClient(clientId: string): OAuthClientInformationFull | undefined {
-    if (this.fileStore) {
-      return this.fileStore.getClient(clientId);
-    }
-    return this.memory.get(clientId);
+    return this.store.getClient(clientId);
   }
 
   registerClient(
@@ -25,11 +20,7 @@ export class ClientStore implements OAuthRegisteredClientsStore {
       client_secret: randomBytes(32).toString("hex"),
       client_secret_expires_at: 0,
     };
-    if (this.fileStore) {
-      this.fileStore.setClient(full.client_id, full);
-    } else {
-      this.memory.set(full.client_id, full);
-    }
+    this.store.setClient(full);
     return full;
   }
 }
